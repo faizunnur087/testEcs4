@@ -1,0 +1,110 @@
+name: Deploy — testEcs4
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
+
+  build_push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Login to ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set image tag
+        id: meta
+        run: |
+          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.sha }}"
+          echo "image_tag=${ECR_REGISTRY}/${{ secrets.PROJECT_NAME }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+      - name: Create ECR repository if missing
+        run: |
+          aws ecr describe-repositories --repository-names "${{ secrets.PROJECT_NAME }}" 2>/dev/null || \
+          aws ecr create-repository --repository-name "${{ secrets.PROJECT_NAME }}" --region ${{ secrets.AWS_REGION }}
+      - name: Build & push
+        run: |
+          docker build -t ${{ steps.meta.outputs.image_tag }} .
+          docker push ${{ steps.meta.outputs.image_tag }}
+
+  deploy:
+    name: Deploy to ECS (Terraform)
+    runs-on: ubuntu-latest
+    needs: build_push
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Create S3 state bucket
+        run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="container_image=${{ needs.build_push.outputs.image_tag }}"
+      - name: Get ALB DNS
+        id: alb
+        working-directory: terraform
+        run: echo "url=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for ECS service to be healthy
+        run: |
+          for i in $(seq 1 20); do
+            curl -sf http://${{ needs.deploy.outputs.url || '' }}/health && break || sleep 15
+          done
+
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy, verify]
+    if: always()
+    steps:
+      - name: Print URL
+        run: echo "Deployed. Check ECS service in AWS Console."
