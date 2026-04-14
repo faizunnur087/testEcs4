@@ -45,11 +45,14 @@ jobs:
         run: |
           ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
           IMAGE_TAG="${{ github.sha }}"
-          echo "image_tag=${ECR_REGISTRY}/${{ secrets.PROJECT_NAME }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          PROJECT_SLUG=$(echo "${{ secrets.PROJECT_NAME }}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+          echo "image_tag=${ECR_REGISTRY}/${PROJECT_SLUG}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "project_slug=${PROJECT_SLUG}" >> $GITHUB_OUTPUT
       - name: Create ECR repository if missing
         run: |
-          aws ecr describe-repositories --repository-names "${{ secrets.PROJECT_NAME }}" 2>/dev/null || \
-          aws ecr create-repository --repository-name "${{ secrets.PROJECT_NAME }}" --region ${{ secrets.AWS_REGION }}
+          PROJECT_SLUG=$(echo "${{ secrets.PROJECT_NAME }}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+          aws ecr describe-repositories --repository-names "${PROJECT_SLUG}" 2>/dev/null || \
+          aws ecr create-repository --repository-name "${PROJECT_SLUG}" --region ${{ secrets.AWS_REGION }}
       - name: Build & push
         run: |
           docker build -t ${{ steps.meta.outputs.image_tag }} .
